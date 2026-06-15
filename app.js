@@ -10,26 +10,10 @@ let lastFrame = performance.now();
 
 const state = {
   fillLevel: 0.62,
-  horizontalOffset: 0,
-  horizontalVelocity: 0,
-  surfaceTilt: 0,
-  surfaceTiltVelocity: 0,
   orientationTilt: 0,
-  verticalPulse: 0,
-  waveEnergy: 0.18,
-  wavePhase: 0,
-  interiorGlow: 0.2,
-  surfaceGlow: 0.3,
-  wallGlowLeft: 0.08,
-  wallGlowRight: 0.08,
-  bottomGlow: 0.12,
-  leftGlowCenter: 0,
-  rightGlowCenter: 0,
-  bottomGlowCenter: 0,
-  impactCooldownLeft: 0,
-  impactCooldownRight: 0,
-  impactCooldownBottom: 0,
-  blooms: [],
+  driveX: 0,
+  driveY: 0,
+  agitation: 0,
   lastMotion: null,
   lastPointer: null,
   pointerDown: false,
@@ -37,12 +21,10 @@ const state = {
   orientationEnabled: false
 };
 
+const sim = createSimulation(84, 148);
+
 function clamp(value, min, max) {
   return Math.max(min, Math.min(max, value));
-}
-
-function lerp(a, b, t) {
-  return a + (b - a) * t;
 }
 
 function roundedRectPath(x, y, w, h, r) {
@@ -100,111 +82,473 @@ function setStatus(text) {
   statusEl.textContent = text;
 }
 
-function addBloom(side, power, scene) {
-  const fillDepth = scene.innerHeight * state.fillLevel;
-  const baseSurfaceY = scene.innerBottom - fillDepth;
-  const slopePx = state.surfaceTilt * scene.innerHeight * 0.34;
-  const waveAmp = (8 * DPR + scene.innerHeight * 0.012) * state.waveEnergy;
-  const meniscus = 8 * DPR;
+function createSimulation(cols, rows) {
+  const size = cols * rows;
 
-  if (side === "left") {
-    const y = clamp(
-      baseSurfaceY - slopePx + Math.sin(state.wavePhase + Math.PI * 0.3) * waveAmp * 0.18 - meniscus * 0.4,
-      scene.innerTop + 18 * DPR,
-      scene.innerBottom - 42 * DPR
-    );
+  return {
+    cols,
+    rows,
+    size,
+    maxMass: 1,
+    maxCompress: 0.03,
+    minMass: 0.0001,
+    minFlow: 0.00008,
+    maxFlow: 0.9,
+    flowRate: 0.5,
+    inside: new Uint8Array(size),
+    wall: new Uint8Array(size),
+    mass: new Float32Array(size),
+    nextMass: new Float32Array(size),
+    glow: new Float32Array(size),
+    nextGlow: new Float32Array(size),
+    excite: new Float32Array(size),
+    surface: new Float32Array(cols),
+    bufferCanvas: document.createElement("canvas"),
+    bufferCtx: null,
+    imageData: null,
+    initialized: false
+  };
+}
 
-    state.blooms.push({
-      x: scene.innerLeft + 2 * DPR,
-      y,
-      rx: 34 * DPR,
-      ry: 88 * DPR,
-      power,
-      age: 0,
-      life: 0.85
-    });
-    state.leftGlowCenter = y;
+function isInsideRoundedRect(nx, ny, radius = 0.14) {
+  const dx = Math.abs(nx - 0.5);
+  const dy = Math.abs(ny - 0.5);
+  const qx = Math.max(dx - (0.5 - radius), 0);
+  const qy = Math.max(dy - (0.5 - radius), 0);
+  return qx * qx + qy * qy <= radius * radius;
+}
+
+function indexAt(x, y) {
+  return y * sim.cols + x;
+}
+
+function initializeSimulation() {
+  sim.bufferCanvas.width = sim.cols;
+  sim.bufferCanvas.height = sim.rows;
+  sim.bufferCtx = sim.bufferCanvas.getContext("2d");
+  sim.imageData = sim.bufferCtx.createImageData(sim.cols, sim.rows);
+
+  for (let y = 0; y < sim.rows; y++) {
+    for (let x = 0; x < sim.cols; x++) {
+      const idx = indexAt(x, y);
+      const nx = (x + 0.5) / sim.cols;
+      const ny = (y + 0.5) / sim.rows;
+
+      if (!isInsideRoundedRect(nx, ny)) {
+        continue;
+      }
+
+      sim.inside[idx] = 1;
+    }
   }
 
-  if (side === "right") {
-    const y = clamp(
-      baseSurfaceY + slopePx + Math.sin(state.wavePhase + Math.PI * 0.8) * waveAmp * 0.18 - meniscus * 0.4,
-      scene.innerTop + 18 * DPR,
-      scene.innerBottom - 42 * DPR
-    );
+  for (let y = 0; y < sim.rows; y++) {
+    for (let x = 0; x < sim.cols; x++) {
+      const idx = indexAt(x, y);
+      if (!sim.inside[idx]) {
+        continue;
+      }
 
-    state.blooms.push({
-      x: scene.innerRight - 2 * DPR,
-      y,
-      rx: 34 * DPR,
-      ry: 88 * DPR,
-      power,
-      age: 0,
-      life: 0.85
-    });
-    state.rightGlowCenter = y;
+      const neighbors = [
+        [x - 1, y],
+        [x + 1, y],
+        [x, y - 1],
+        [x, y + 1]
+      ];
+
+      for (const [nx, ny] of neighbors) {
+        if (
+          nx < 0 ||
+          nx >= sim.cols ||
+          ny < 0 ||
+          ny >= sim.rows ||
+          !sim.inside[indexAt(nx, ny)]
+        ) {
+          sim.wall[idx] = 1;
+          break;
+        }
+      }
+    }
   }
 
-  if (side === "bottom") {
-    state.bottomGlowCenter = scene.centerX + state.horizontalOffset * 0.28;
-    state.blooms.push({
-      x: state.bottomGlowCenter,
-      y: scene.innerBottom - 5 * DPR,
-      rx: 130 * DPR,
-      ry: 34 * DPR,
-      power,
-      age: 0,
-      life: 1.05
-    });
+  resetLiquid(state.fillLevel);
+  sim.initialized = true;
+}
+
+function resetLiquid(fillLevel) {
+  sim.mass.fill(0);
+  sim.glow.fill(0);
+  sim.excite.fill(0);
+
+  const fillLine = sim.rows * (1 - fillLevel);
+
+  for (let y = 0; y < sim.rows; y++) {
+    for (let x = 0; x < sim.cols; x++) {
+      const idx = indexAt(x, y);
+      if (!sim.inside[idx]) {
+        continue;
+      }
+
+      const amount = clamp(y + 1 - fillLine, 0, 1);
+      sim.mass[idx] = amount;
+    }
   }
 }
 
-function triggerImpact(side, power, scene) {
-  const intensity = clamp(power, 0.25, 1.6);
-
-  state.surfaceGlow = clamp(state.surfaceGlow + intensity * 0.35, 0, 1.8);
-  state.interiorGlow = clamp(state.interiorGlow + intensity * 0.24, 0, 1.5);
-  state.waveEnergy = clamp(state.waveEnergy + intensity * 0.18, 0, 1.8);
-
-  if (side === "left") {
-    state.wallGlowLeft = clamp(state.wallGlowLeft + intensity * 0.95, 0, 2);
-    state.impactCooldownLeft = 0.16;
+function getStableState(totalMass) {
+  if (totalMass <= sim.maxMass) {
+    return sim.maxMass;
   }
 
-  if (side === "right") {
-    state.wallGlowRight = clamp(state.wallGlowRight + intensity * 0.95, 0, 2);
-    state.impactCooldownRight = 0.16;
+  if (totalMass < sim.maxMass * 2 + sim.maxCompress) {
+    return (
+      sim.maxMass * sim.maxMass +
+      totalMass * sim.maxCompress
+    ) / (sim.maxMass + sim.maxCompress);
   }
 
-  if (side === "bottom") {
-    state.bottomGlow = clamp(state.bottomGlow + intensity, 0, 2);
-    state.impactCooldownBottom = 0.24;
-  }
-
-  addBloom(side, intensity, scene);
+  return (totalMass + sim.maxCompress) * 0.5;
 }
 
-function applyImpulse(xImpulse, yImpulse, strength = 1) {
-  state.horizontalVelocity += xImpulse * 520 * DPR;
-  state.surfaceTiltVelocity += xImpulse * 1.2;
-  state.verticalPulse = clamp(
-    state.verticalPulse + Math.abs(yImpulse) * 0.75 + strength * 0.16,
+function transferMass(fromIdx, toIdx, flow) {
+  if (flow <= 0) {
+    return 0;
+  }
+
+  const actual = Math.min(flow, sim.nextMass[fromIdx]);
+  if (actual <= 0) {
+    return 0;
+  }
+
+  sim.nextMass[fromIdx] -= actual;
+  sim.nextMass[toIdx] += actual;
+  return actual;
+}
+
+function disturbCell(x, y, amount) {
+  if (x < 0 || x >= sim.cols || y < 0 || y >= sim.rows) {
+    return;
+  }
+
+  const idx = indexAt(x, y);
+  if (!sim.inside[idx]) {
+    return;
+  }
+
+  sim.excite[idx] += amount;
+}
+
+function stirAt(clientX, clientY, dx, dy, strength) {
+  const scene = getScene();
+  const px = clientX * DPR;
+  const py = clientY * DPR;
+
+  if (
+    px < scene.innerLeft ||
+    px > scene.innerRight ||
+    py < scene.innerTop ||
+    py > scene.innerBottom
+  ) {
+    state.driveX += dx * 0.0022;
+    state.driveY += Math.abs(dy) * 0.0016;
+    state.agitation += strength * 0.05;
+    return;
+  }
+
+  const gx = clamp(
+    Math.floor(((px - scene.innerLeft) / scene.innerWidth) * sim.cols),
     0,
-    1.8
+    sim.cols - 1
   );
-  state.waveEnergy = clamp(
-    state.waveEnergy + Math.abs(xImpulse) * 0.22 + strength * 0.12,
+  const gy = clamp(
+    Math.floor(((py - scene.innerTop) / scene.innerHeight) * sim.rows),
     0,
-    1.8
+    sim.rows - 1
   );
-  state.surfaceGlow = clamp(state.surfaceGlow + strength * 0.08, 0, 1.8);
-  state.interiorGlow = clamp(state.interiorGlow + strength * 0.06, 0, 1.5);
+  const len = Math.max(1, Math.hypot(dx, dy));
+  const dirX = dx / len;
+  const dirY = dy / len;
+  const radius = 4;
+
+  for (let oy = -radius; oy <= radius; oy++) {
+    for (let ox = -radius; ox <= radius; ox++) {
+      const x = gx + ox;
+      const y = gy + oy;
+      if (x < 0 || x >= sim.cols || y < 0 || y >= sim.rows) {
+        continue;
+      }
+
+      const idx = indexAt(x, y);
+      if (!sim.inside[idx]) {
+        continue;
+      }
+
+      const dist = Math.hypot(ox, oy) / radius;
+      if (dist > 1) {
+        continue;
+      }
+
+      const falloff = 1 - dist;
+      const targetX = clamp(x + Math.round(dirX * 1.4), 0, sim.cols - 1);
+      const targetY = clamp(y + Math.round(dirY * 1.4), 0, sim.rows - 1);
+      const targetIdx = indexAt(targetX, targetY);
+      if (!sim.inside[targetIdx]) {
+        sim.excite[idx] += strength * falloff * 0.18;
+        continue;
+      }
+
+      const moved = Math.min(sim.mass[idx], 0.08 * falloff * strength);
+      sim.mass[idx] -= moved;
+      sim.mass[targetIdx] += moved;
+      sim.excite[targetIdx] += strength * falloff * 0.12;
+    }
+  }
+
+  state.driveX += dx * 0.0025;
+  state.driveY += Math.abs(dy) * 0.0018;
+  state.agitation += strength * 0.08;
 }
 
-function drawBackground(scene, time) {
+function simulateSubstep(flowBiasX, verticalBias, agitation) {
+  sim.nextMass.set(sim.mass);
+
+  const sideOrder = flowBiasX >= 0 ? [1, -1] : [-1, 1];
+  const lateralBias = Math.abs(flowBiasX);
+
+  for (let y = sim.rows - 1; y >= 0; y--) {
+    for (let x = 0; x < sim.cols; x++) {
+      const idx = indexAt(x, y);
+      if (!sim.inside[idx]) {
+        continue;
+      }
+
+      let remaining = sim.mass[idx];
+      if (remaining <= sim.minMass) {
+        continue;
+      }
+
+      const belowY = y + 1;
+      if (belowY < sim.rows) {
+        const belowIdx = indexAt(x, belowY);
+        if (sim.inside[belowIdx]) {
+          let flow = getStableState(remaining + sim.mass[belowIdx]) - sim.mass[belowIdx];
+          if (flow > sim.minFlow) {
+            flow *= sim.flowRate;
+          }
+          flow += Math.max(0, verticalBias) * 0.018;
+          flow = clamp(flow, 0, Math.min(sim.maxFlow, remaining));
+          const moved = transferMass(idx, belowIdx, flow);
+          remaining -= moved;
+
+          if (belowY >= sim.rows - 2 && moved > 0.04) {
+            const hit = moved * (0.42 + agitation * 0.2 + Math.max(0, verticalBias) * 0.7);
+            sim.excite[belowIdx] += hit;
+            if (x > 0 && sim.inside[indexAt(x - 1, belowY)]) {
+              sim.excite[indexAt(x - 1, belowY)] += hit * 0.22;
+            }
+            if (x < sim.cols - 1 && sim.inside[indexAt(x + 1, belowY)]) {
+              sim.excite[indexAt(x + 1, belowY)] += hit * 0.22;
+            }
+          }
+        } else {
+          sim.excite[idx] += remaining * Math.max(0, verticalBias) * 0.16;
+        }
+      }
+
+      for (const dir of sideOrder) {
+        if (remaining <= sim.minMass) {
+          break;
+        }
+
+        const nx = x + dir;
+        if (nx < 0 || nx >= sim.cols) {
+          continue;
+        }
+
+        const neighborIdx = indexAt(nx, y);
+        const bias = Math.max(0, dir * flowBiasX);
+
+        if (!sim.inside[neighborIdx]) {
+          const wallHit = remaining * (0.05 + lateralBias * 0.08 + bias * 0.22 + agitation * 0.05);
+          sim.excite[idx] += wallHit;
+
+          if (y > 0) {
+            const upIdx = indexAt(x, y - 1);
+            if (sim.inside[upIdx]) {
+              const climb = Math.min(remaining, wallHit * 0.08);
+              const moved = transferMass(idx, upIdx, climb);
+              remaining -= moved;
+              sim.excite[upIdx] += wallHit * 0.3;
+            }
+          }
+
+          continue;
+        }
+
+        const diff = remaining - sim.mass[neighborIdx];
+        let flow = diff * (0.12 + bias * 0.16) + bias * 0.03;
+        if (flow > sim.minFlow) {
+          flow *= 0.5;
+        }
+        flow = clamp(flow, 0, Math.min(sim.maxFlow * 0.42, remaining));
+        const moved = transferMass(idx, neighborIdx, flow);
+        remaining -= moved;
+
+        if (moved > 0.025) {
+          const shear = moved * (0.12 + bias * 0.4 + agitation * 0.08);
+          sim.excite[neighborIdx] += shear;
+        }
+      }
+
+      if (remaining > sim.maxMass && y > 0) {
+        const upIdx = indexAt(x, y - 1);
+        if (sim.inside[upIdx]) {
+          let flow = remaining - getStableState(remaining + sim.mass[upIdx]);
+          if (flow > sim.minFlow) {
+            flow *= 0.5;
+          }
+          flow = clamp(flow, 0, Math.min(sim.maxFlow * 0.26, remaining));
+          const moved = transferMass(idx, upIdx, flow);
+          if (moved > 0.018 && sim.wall[idx]) {
+            sim.excite[upIdx] += moved * 0.22;
+          }
+        }
+      }
+    }
+  }
+
+  for (let i = 0; i < sim.size; i++) {
+    if (!sim.inside[i]) {
+      sim.mass[i] = 0;
+      continue;
+    }
+
+    sim.mass[i] = clamp(sim.nextMass[i], 0, 1.2);
+  }
+}
+
+function updateGlow(dt) {
+  const decay = Math.exp(-dt * 2.4);
+  const diffuse = Math.min(0.16, dt * 3.8);
+
+  for (let y = 0; y < sim.rows; y++) {
+    for (let x = 0; x < sim.cols; x++) {
+      const idx = indexAt(x, y);
+      if (!sim.inside[idx]) {
+        sim.nextGlow[idx] = 0;
+        continue;
+      }
+
+      const here = sim.glow[idx];
+      let neighborSum = 0;
+      let count = 0;
+
+      if (x > 0 && sim.inside[indexAt(x - 1, y)]) {
+        neighborSum += sim.glow[indexAt(x - 1, y)];
+        count++;
+      }
+      if (x < sim.cols - 1 && sim.inside[indexAt(x + 1, y)]) {
+        neighborSum += sim.glow[indexAt(x + 1, y)];
+        count++;
+      }
+      if (y > 0 && sim.inside[indexAt(x, y - 1)]) {
+        neighborSum += sim.glow[indexAt(x, y - 1)];
+        count++;
+      }
+      if (y < sim.rows - 1 && sim.inside[indexAt(x, y + 1)]) {
+        neighborSum += sim.glow[indexAt(x, y + 1)];
+        count++;
+      }
+
+      const blended = count > 0 ? here * (1 - diffuse) + (neighborSum / count) * diffuse : here;
+      const fluidMask = clamp(sim.mass[idx] * 1.35, 0, 1);
+      const added = sim.excite[idx] * fluidMask;
+      sim.nextGlow[idx] = clamp(blended * decay + added, 0, 1.6);
+      sim.excite[idx] = 0;
+    }
+  }
+
+  const swap = sim.glow;
+  sim.glow = sim.nextGlow;
+  sim.nextGlow = swap;
+}
+
+function computeSurface() {
+  for (let x = 0; x < sim.cols; x++) {
+    sim.surface[x] = sim.rows;
+
+    for (let y = 0; y < sim.rows; y++) {
+      const idx = indexAt(x, y);
+      if (!sim.inside[idx]) {
+        continue;
+      }
+
+      if (sim.mass[idx] > 0.08) {
+        sim.surface[x] = y + (1 - clamp(sim.mass[idx], 0, 1));
+        break;
+      }
+    }
+  }
+}
+
+function publishDebug(flowBiasX, verticalBias) {
+  let glowingCells = 0;
+  let activeCells = 0;
+  let maxGlow = 0;
+
+  for (let i = 0; i < sim.size; i++) {
+    if (!sim.inside[i]) {
+      continue;
+    }
+
+    if (sim.mass[i] > 0.08) {
+      activeCells++;
+    }
+
+    if (sim.glow[i] > 0.04) {
+      glowingCells++;
+    }
+
+    if (sim.glow[i] > maxGlow) {
+      maxGlow = sim.glow[i];
+    }
+  }
+
+  window.__blueTearsDebug = {
+    activeCells,
+    glowingCells,
+    maxGlow,
+    driveX: state.driveX,
+    driveY: state.driveY,
+    agitation: state.agitation,
+    flowBiasX,
+    verticalBias
+  };
+}
+
+function update(dt) {
+  const flowBiasX = clamp(state.orientationTilt * 0.48 + state.driveX, -1.5, 1.5);
+  const verticalBias = clamp(state.driveY + state.agitation * 0.36, -0.25, 1.75);
+  const agitation = clamp(state.agitation, 0, 1.8);
+  const substeps = 3;
+
+  for (let step = 0; step < substeps; step++) {
+    simulateSubstep(flowBiasX, verticalBias, agitation);
+  }
+
+  updateGlow(dt);
+  computeSurface();
+  publishDebug(flowBiasX, verticalBias);
+
+  state.driveX *= Math.exp(-dt * 3.6);
+  state.driveY *= Math.exp(-dt * 4.2);
+  state.agitation *= Math.exp(-dt * 2.2);
+}
+
+function drawBackground(scene) {
   const bg = ctx.createLinearGradient(0, 0, 0, H);
   bg.addColorStop(0, "#02040a");
-  bg.addColorStop(0.38, "#04111e");
+  bg.addColorStop(0.38, "#04101c");
   bg.addColorStop(1, "#010308");
   ctx.fillStyle = bg;
   ctx.fillRect(0, 0, W, H);
@@ -212,213 +556,142 @@ function drawBackground(scene, time) {
   const halo = ctx.createRadialGradient(
     scene.centerX,
     scene.centerY + scene.bottleHeight * 0.12,
-    scene.bottleWidth * 0.1,
+    scene.bottleWidth * 0.12,
     scene.centerX,
     scene.centerY + scene.bottleHeight * 0.12,
     scene.bottleWidth * 1.1
   );
-  halo.addColorStop(0, "rgba(18, 152, 210, 0.16)");
-  halo.addColorStop(0.46, "rgba(8, 88, 132, 0.12)");
-  halo.addColorStop(1, "rgba(1, 8, 18, 0)");
+  halo.addColorStop(0, "rgba(14, 122, 182, 0.16)");
+  halo.addColorStop(0.5, "rgba(6, 66, 108, 0.12)");
+  halo.addColorStop(1, "rgba(0, 10, 18, 0)");
   ctx.fillStyle = halo;
   ctx.fillRect(0, 0, W, H);
+}
 
-  ctx.save();
-  ctx.globalAlpha = 0.085;
-  ctx.strokeStyle = "rgba(90, 198, 255, 0.14)";
-  ctx.lineWidth = 1 * DPR;
+function drawSimulation(scene) {
+  const pixels = sim.imageData.data;
 
-  for (let i = 0; i < 11; i++) {
-    const y = H * (0.12 + i * 0.075);
-    ctx.beginPath();
-    for (let x = -40 * DPR; x <= W + 40 * DPR; x += 20 * DPR) {
-      const wave =
-        Math.sin(x * 0.008 + time * 0.00055 + i * 0.7) * (4 + i * 0.2) * DPR +
-        Math.sin(x * 0.015 + time * 0.0008) * 2 * DPR;
-      if (x <= -40 * DPR) {
-        ctx.moveTo(x, y + wave);
-      } else {
-        ctx.lineTo(x, y + wave);
+  for (let y = 0; y < sim.rows; y++) {
+    for (let x = 0; x < sim.cols; x++) {
+      const idx = indexAt(x, y);
+      const offset = idx * 4;
+
+      if (!sim.inside[idx]) {
+        pixels[offset] = 0;
+        pixels[offset + 1] = 0;
+        pixels[offset + 2] = 0;
+        pixels[offset + 3] = 0;
+        continue;
       }
+
+      const mass = sim.mass[idx];
+      const glow = sim.glow[idx];
+      const depth = y / (sim.rows - 1);
+      const fluid = clamp(mass, 0, 1);
+      const lum = clamp(glow, 0, 1.6);
+
+      const r = Math.round(10 + depth * 26 + lum * 92);
+      const g = Math.round(56 + depth * 54 + lum * 136);
+      const b = Math.round(120 + depth * 64 + lum * 110);
+      const alpha = Math.round(clamp(fluid * 0.94 + lum * 0.26, 0, 1) * 255);
+
+      pixels[offset] = r;
+      pixels[offset + 1] = g;
+      pixels[offset + 2] = b;
+      pixels[offset + 3] = alpha;
     }
-    ctx.stroke();
   }
 
-  ctx.restore();
-}
-
-function getSurfacePoints(scene) {
-  const fillDepth = scene.innerHeight * state.fillLevel;
-  const baseSurfaceY = scene.innerBottom - fillDepth;
-  const slopePx = state.surfaceTilt * scene.innerHeight * 0.34;
-  const waveAmp = (8 * DPR + scene.innerHeight * 0.012) * state.waveEnergy;
-  const meniscus = 9 * DPR;
-  const points = [];
-  const samples = 26;
-
-  for (let i = 0; i <= samples; i++) {
-    const t = i / samples;
-    const x = lerp(scene.innerLeft, scene.innerRight, t);
-    const centered = (t - 0.5) * 2;
-    const wave =
-      Math.sin(t * Math.PI * 2 + state.wavePhase) * waveAmp * 0.24 +
-      Math.sin(t * Math.PI * 4 + state.wavePhase * 1.4) * waveAmp * 0.12;
-    const edgeLift =
-      Math.pow(1 - Math.abs(centered), 0.55) * 0 -
-      (Math.pow(1 - t, 7) + Math.pow(t, 7)) * meniscus;
-
-    const y = baseSurfaceY + centered * slopePx + wave + edgeLift;
-    points.push({ x, y });
-  }
-
-  return points;
-}
-
-function drawLiquid(scene) {
-  const surface = getSurfacePoints(scene);
+  sim.bufferCtx.putImageData(sim.imageData, 0, 0);
 
   ctx.save();
   roundedRectPath(scene.bottleX, scene.bottleY, scene.bottleWidth, scene.bottleHeight, scene.radius);
   ctx.clip();
 
   const glassBase = ctx.createLinearGradient(0, scene.bottleY, 0, scene.bottleY + scene.bottleHeight);
-  glassBase.addColorStop(0, "rgba(7, 18, 30, 0.76)");
-  glassBase.addColorStop(0.5, "rgba(3, 11, 23, 0.92)");
-  glassBase.addColorStop(1, "rgba(2, 8, 16, 0.98)");
+  glassBase.addColorStop(0, "rgba(7, 18, 30, 0.72)");
+  glassBase.addColorStop(0.5, "rgba(3, 10, 20, 0.9)");
+  glassBase.addColorStop(1, "rgba(2, 7, 15, 0.98)");
   ctx.fillStyle = glassBase;
   ctx.fillRect(scene.bottleX, scene.bottleY, scene.bottleWidth, scene.bottleHeight);
 
   ctx.save();
   ctx.beginPath();
-  ctx.moveTo(surface[0].x, surface[0].y);
-  for (let i = 1; i < surface.length; i++) {
-    ctx.lineTo(surface[i].x, surface[i].y);
-  }
-  ctx.lineTo(scene.innerRight, scene.innerBottom);
-  ctx.lineTo(scene.innerLeft, scene.innerBottom);
-  ctx.closePath();
+  ctx.rect(scene.innerLeft, scene.innerTop, scene.innerWidth, scene.innerHeight);
   ctx.clip();
+  ctx.imageSmoothingEnabled = true;
+  ctx.drawImage(sim.bufferCanvas, scene.innerLeft, scene.innerTop, scene.innerWidth, scene.innerHeight);
 
-  const liquid = ctx.createLinearGradient(0, scene.innerTop, 0, scene.innerBottom);
-  liquid.addColorStop(0, "rgba(22, 132, 172, 0.72)");
-  liquid.addColorStop(0.28, "rgba(10, 84, 138, 0.76)");
-  liquid.addColorStop(1, "rgba(2, 25, 46, 0.96)");
-  ctx.fillStyle = liquid;
+  const liquidShade = ctx.createLinearGradient(0, scene.innerTop, 0, scene.innerBottom);
+  liquidShade.addColorStop(0, "rgba(180, 238, 255, 0.07)");
+  liquidShade.addColorStop(0.45, "rgba(22, 74, 130, 0.05)");
+  liquidShade.addColorStop(1, "rgba(0, 18, 38, 0.18)");
+  ctx.fillStyle = liquidShade;
   ctx.fillRect(scene.innerLeft, scene.innerTop, scene.innerWidth, scene.innerHeight);
-
-  const bodyMist = ctx.createRadialGradient(
-    scene.centerX + state.horizontalOffset * 0.18,
-    scene.innerBottom - scene.innerHeight * 0.24,
-    8 * DPR,
-    scene.centerX + state.horizontalOffset * 0.18,
-    scene.innerBottom - scene.innerHeight * 0.24,
-    scene.innerWidth * 0.65
-  );
-  bodyMist.addColorStop(0, `rgba(61, 228, 255, ${0.1 + state.interiorGlow * 0.16})`);
-  bodyMist.addColorStop(0.42, `rgba(18, 142, 200, ${0.08 + state.interiorGlow * 0.1})`);
-  bodyMist.addColorStop(1, "rgba(5, 38, 74, 0)");
-  ctx.fillStyle = bodyMist;
-  ctx.fillRect(scene.innerLeft, scene.innerTop, scene.innerWidth, scene.innerHeight);
-
-  for (const bloom of state.blooms) {
-    const k = bloom.age / bloom.life;
-    const alpha = Math.pow(1 - k, 1.6) * bloom.power * 0.46;
-    const gradient = ctx.createRadialGradient(
-      bloom.x,
-      bloom.y,
-      0,
-      bloom.x,
-      bloom.y,
-      Math.max(bloom.rx, bloom.ry)
-    );
-    gradient.addColorStop(0, `rgba(133, 249, 255, ${alpha})`);
-    gradient.addColorStop(0.4, `rgba(42, 206, 255, ${alpha * 0.72})`);
-    gradient.addColorStop(1, "rgba(2, 90, 160, 0)");
-    ctx.fillStyle = gradient;
-    ctx.beginPath();
-    ctx.ellipse(bloom.x, bloom.y, bloom.rx, bloom.ry, 0, 0, Math.PI * 2);
-    ctx.fill();
-  }
-
-  const leftGlowY = state.leftGlowCenter || (scene.innerBottom - scene.innerHeight * state.fillLevel);
-  const leftGlow = ctx.createRadialGradient(
-    scene.innerLeft,
-    leftGlowY,
-    0,
-    scene.innerLeft,
-    leftGlowY,
-    scene.innerHeight * 0.24
-  );
-  leftGlow.addColorStop(0, `rgba(112, 242, 255, ${0.08 + state.wallGlowLeft * 0.22})`);
-  leftGlow.addColorStop(0.42, `rgba(28, 192, 255, ${0.04 + state.wallGlowLeft * 0.12})`);
-  leftGlow.addColorStop(1, "rgba(12, 114, 185, 0)");
-  ctx.fillStyle = leftGlow;
-  ctx.fillRect(
-    scene.innerLeft - scene.innerWidth * 0.05,
-    leftGlowY - scene.innerHeight * 0.26,
-    scene.innerWidth * 0.32,
-    scene.innerHeight * 0.52
-  );
-
-  const rightGlowY = state.rightGlowCenter || (scene.innerBottom - scene.innerHeight * state.fillLevel);
-  const rightGlow = ctx.createRadialGradient(
-    scene.innerRight,
-    rightGlowY,
-    0,
-    scene.innerRight,
-    rightGlowY,
-    scene.innerHeight * 0.24
-  );
-  rightGlow.addColorStop(0, `rgba(112, 242, 255, ${0.08 + state.wallGlowRight * 0.22})`);
-  rightGlow.addColorStop(0.42, `rgba(28, 192, 255, ${0.04 + state.wallGlowRight * 0.12})`);
-  rightGlow.addColorStop(1, "rgba(12, 114, 185, 0)");
-  ctx.fillStyle = rightGlow;
-  ctx.fillRect(
-    scene.innerRight - scene.innerWidth * 0.27,
-    rightGlowY - scene.innerHeight * 0.26,
-    scene.innerWidth * 0.32,
-    scene.innerHeight * 0.52
-  );
-
-  const bottomGlow = ctx.createRadialGradient(
-    state.bottomGlowCenter || (scene.centerX + state.horizontalOffset * 0.24),
-    scene.innerBottom,
-    10 * DPR,
-    state.bottomGlowCenter || (scene.centerX + state.horizontalOffset * 0.24),
-    scene.innerBottom,
-    scene.innerWidth * 0.55
-  );
-  bottomGlow.addColorStop(0, `rgba(103, 244, 255, ${0.1 + state.bottomGlow * 0.22})`);
-  bottomGlow.addColorStop(0.58, `rgba(28, 194, 255, ${0.04 + state.bottomGlow * 0.1})`);
-  bottomGlow.addColorStop(1, "rgba(2, 36, 82, 0)");
-  ctx.fillStyle = bottomGlow;
-  ctx.fillRect(scene.innerLeft, scene.innerBottom - scene.innerHeight * 0.22, scene.innerWidth, scene.innerHeight * 0.26);
-
   ctx.restore();
 
   ctx.save();
   ctx.globalCompositeOperation = "screen";
-  ctx.strokeStyle = `rgba(146, 248, 255, ${0.26 + state.surfaceGlow * 0.2})`;
-  ctx.lineWidth = 2.2 * DPR;
-  ctx.shadowColor = "rgba(61, 228, 255, 0.7)";
-  ctx.shadowBlur = 16 * DPR;
+  ctx.shadowColor = "rgba(77, 228, 255, 0.42)";
+  ctx.shadowBlur = 12 * DPR;
+  ctx.lineWidth = 2.1 * DPR;
+  ctx.strokeStyle = "rgba(163, 247, 255, 0.55)";
   ctx.beginPath();
-  ctx.moveTo(surface[0].x, surface[0].y);
-  for (let i = 1; i < surface.length; i++) {
-    ctx.lineTo(surface[i].x, surface[i].y);
+
+  let started = false;
+  for (let x = 0; x < sim.cols; x++) {
+    const y = sim.surface[x];
+    if (y >= sim.rows) {
+      continue;
+    }
+
+    const px = scene.innerLeft + (x / (sim.cols - 1)) * scene.innerWidth;
+    const py = scene.innerTop + (y / (sim.rows - 1)) * scene.innerHeight;
+
+    if (!started) {
+      ctx.moveTo(px, py);
+      started = true;
+    } else {
+      ctx.lineTo(px, py);
+    }
   }
-  ctx.stroke();
-  ctx.restore();
+
+  if (started) {
+    ctx.stroke();
+  }
 
   ctx.restore();
 
+  const innerGlow = ctx.createRadialGradient(
+    scene.centerX,
+    scene.innerBottom - scene.innerHeight * 0.18,
+    10 * DPR,
+    scene.centerX,
+    scene.innerBottom - scene.innerHeight * 0.18,
+    scene.innerWidth * 0.7
+  );
+  innerGlow.addColorStop(0, "rgba(70, 216, 255, 0.12)");
+  innerGlow.addColorStop(0.5, "rgba(18, 112, 180, 0.06)");
+  innerGlow.addColorStop(1, "rgba(2, 26, 60, 0)");
+  ctx.fillStyle = innerGlow;
+  ctx.fillRect(scene.innerLeft, scene.innerTop, scene.innerWidth, scene.innerHeight);
+
+  ctx.restore();
+}
+
+function drawBottle(scene) {
   ctx.save();
   roundedRectPath(scene.bottleX, scene.bottleY, scene.bottleWidth, scene.bottleHeight, scene.radius);
   ctx.strokeStyle = "rgba(196, 246, 255, 0.34)";
   ctx.lineWidth = 1.6 * DPR;
   ctx.stroke();
 
-  const outerGlow = ctx.createLinearGradient(scene.bottleX, scene.bottleY, scene.bottleX + scene.bottleWidth, scene.bottleY + scene.bottleHeight);
+  const outerGlow = ctx.createLinearGradient(
+    scene.bottleX,
+    scene.bottleY,
+    scene.bottleX + scene.bottleWidth,
+    scene.bottleY + scene.bottleHeight
+  );
   outerGlow.addColorStop(0, "rgba(166, 239, 255, 0.16)");
   outerGlow.addColorStop(0.45, "rgba(92, 170, 212, 0.06)");
   outerGlow.addColorStop(1, "rgba(255, 255, 255, 0.02)");
@@ -452,91 +725,30 @@ function drawLiquid(scene) {
   );
   ctx.closePath();
   ctx.fill();
-
   ctx.restore();
-}
-
-function update(dt, scene) {
-  const maxOffset = scene.innerWidth * 0.16;
-  const targetOffset = clamp(state.orientationTilt * scene.innerWidth * 0.1, -maxOffset * 0.7, maxOffset * 0.7);
-  const offsetAccel = (targetOffset - state.horizontalOffset) * 11 - state.horizontalVelocity * 4.8;
-  state.horizontalVelocity += offsetAccel * dt;
-  state.horizontalOffset = clamp(state.horizontalOffset + state.horizontalVelocity * dt, -maxOffset, maxOffset);
-
-  const targetTilt = clamp(
-    state.orientationTilt * 0.18 + (state.horizontalOffset / scene.innerWidth) * 0.46,
-    -0.24,
-    0.24
-  );
-  const tiltAccel = (targetTilt - state.surfaceTilt) * 18 - state.surfaceTiltVelocity * 5.6;
-  state.surfaceTiltVelocity += tiltAccel * dt;
-  state.surfaceTilt = clamp(state.surfaceTilt + state.surfaceTiltVelocity * dt, -0.28, 0.28);
-
-  state.wavePhase += dt * (1.8 + state.waveEnergy * 3.1);
-  state.waveEnergy *= Math.exp(-dt * 1.35);
-  state.verticalPulse *= Math.exp(-dt * 2.4);
-  state.interiorGlow *= Math.exp(-dt * 1.3);
-  state.surfaceGlow *= Math.exp(-dt * 1.65);
-  state.wallGlowLeft *= Math.exp(-dt * 2.1);
-  state.wallGlowRight *= Math.exp(-dt * 2.1);
-  state.bottomGlow *= Math.exp(-dt * 1.8);
-  state.impactCooldownLeft = Math.max(0, state.impactCooldownLeft - dt);
-  state.impactCooldownRight = Math.max(0, state.impactCooldownRight - dt);
-  state.impactCooldownBottom = Math.max(0, state.impactCooldownBottom - dt);
-
-  const wallThreshold = maxOffset * 0.58;
-  const leftPressure = clamp((-state.horizontalOffset - wallThreshold) / (maxOffset - wallThreshold), 0, 1.6);
-  const rightPressure = clamp((state.horizontalOffset - wallThreshold) / (maxOffset - wallThreshold), 0, 1.6);
-  const lateralSpeed = Math.abs(state.horizontalVelocity) / (320 * DPR);
-
-  if (state.horizontalVelocity < -32 * DPR && leftPressure > 0.02) {
-    state.wallGlowLeft = clamp(state.wallGlowLeft + leftPressure * 0.12, 0, 1.8);
-  }
-
-  if (state.horizontalVelocity > 32 * DPR && rightPressure > 0.02) {
-    state.wallGlowRight = clamp(state.wallGlowRight + rightPressure * 0.12, 0, 1.8);
-  }
-
-  if (leftPressure > 0.16 && state.horizontalVelocity < -60 * DPR && state.impactCooldownLeft <= 0) {
-    triggerImpact("left", leftPressure * (0.55 + lateralSpeed), scene);
-  }
-
-  if (rightPressure > 0.16 && state.horizontalVelocity > 60 * DPR && state.impactCooldownRight <= 0) {
-    triggerImpact("right", rightPressure * (0.55 + lateralSpeed), scene);
-  }
-
-  const bottomPressure = clamp(state.verticalPulse * 0.9 + lateralSpeed * 0.18, 0, 1.8);
-  if (bottomPressure > 0.22) {
-    state.bottomGlow = clamp(state.bottomGlow + bottomPressure * 0.03, 0, 1.6);
-  }
-
-  if (bottomPressure > 0.58 && state.impactCooldownBottom <= 0) {
-    triggerImpact("bottom", bottomPressure, scene);
-  }
-
-  for (let i = state.blooms.length - 1; i >= 0; i--) {
-    const bloom = state.blooms[i];
-    bloom.age += dt;
-    if (bloom.age >= bloom.life) {
-      state.blooms.splice(i, 1);
-    }
-  }
-
-  if (state.blooms.length > 36) {
-    state.blooms.splice(0, state.blooms.length - 36);
-  }
 }
 
 function render(now) {
   const dt = Math.min(0.032, (now - lastFrame) / 1000 || 0.016);
   lastFrame = now;
 
+  if (!sim.initialized) {
+    initializeSimulation();
+  }
+
   const scene = getScene();
-  update(dt, scene);
-  drawBackground(scene, now);
-  drawLiquid(scene);
+  update(dt);
+  drawBackground(scene);
+  drawSimulation(scene);
+  drawBottle(scene);
 
   requestAnimationFrame(render);
+}
+
+function applyImpulse(xImpulse, yImpulse, strength = 1) {
+  state.driveX = clamp(state.driveX + xImpulse * 0.22, -1.6, 1.6);
+  state.driveY = clamp(state.driveY + Math.abs(yImpulse) * 0.2 + strength * 0.08, -0.4, 1.8);
+  state.agitation = clamp(state.agitation + strength * 0.16 + Math.abs(xImpulse) * 0.04, 0, 1.8);
 }
 
 function motionHandler(event) {
@@ -560,18 +772,18 @@ function motionHandler(event) {
   state.lastMotion = { x, y, z };
 
   const jerk = Math.sqrt(dx * dx + dy * dy + dz * dz);
-  if (jerk < 0.8) {
+  if (jerk < 0.65) {
     return;
   }
 
-  const strength = clamp((jerk - 0.8) / 4.8, 0, 1.8);
-  applyImpulse(dx * 0.08, dy * 0.06, strength);
-  setStatus("检测到晃动，液体正在撞击瓶壁并留下蓝色余辉。");
+  const strength = clamp((jerk - 0.65) / 5.4, 0, 1.8);
+  applyImpulse(dx, dy, strength);
+  setStatus("检测到晃动，液体正在局部撞壁，荧光会在接触带停留后再衰减。");
 }
 
 function orientationHandler(event) {
   const gamma = typeof event.gamma === "number" ? event.gamma : 0;
-  state.orientationTilt = clamp(gamma / 42, -1, 1);
+  state.orientationTilt = clamp(gamma / 36, -1, 1);
 }
 
 async function enableMotion() {
@@ -591,7 +803,7 @@ async function enableMotion() {
       }
 
       if (motionPermission !== "granted" || orientationPermission !== "granted") {
-        setStatus("传感器未授权。你仍然可以拖动屏幕，观察液体撞壁发光。");
+        setStatus("传感器未授权。你仍然可以拖动屏幕，直接搅动瓶中的液体。");
         return;
       }
     }
@@ -606,7 +818,7 @@ async function enableMotion() {
       state.orientationEnabled = true;
     }
 
-    setStatus("运动感应已启用。轻微倾斜看液面变化，快速晃动看瓶壁和底部发光。");
+    setStatus("运动感应已启用。轻微倾斜看液体堆积，快速晃动看局部撞壁发光。");
     enableBtn.textContent = "运动感应已启用";
     enableBtn.disabled = true;
   } catch (error) {
@@ -625,12 +837,11 @@ function pointerImpulse(clientX, clientY) {
 
   const dx = clientX - state.lastPointer.x;
   const dy = clientY - state.lastPointer.y;
-  const dt = Math.max(16, now - state.lastPointer.t);
-  const speedX = dx / dt;
-  const speedY = dy / dt;
-  const strength = clamp(Math.sqrt(speedX * speedX + speedY * speedY) * 8, 0.08, 1.6);
+  const elapsed = Math.max(16, now - state.lastPointer.t);
+  const speed = Math.hypot(dx, dy) / elapsed;
+  const strength = clamp(speed * 9, 0.08, 1.7);
 
-  applyImpulse(speedX * 1.35, speedY * 0.9, strength);
+  stirAt(clientX, clientY, dx, dy, strength);
   state.lastPointer = { x: clientX, y: clientY, t: now };
 }
 
@@ -642,7 +853,7 @@ enableBtn.addEventListener("click", enableMotion);
 window.addEventListener("pointerdown", (event) => {
   state.pointerDown = true;
   state.lastPointer = { x: event.clientX, y: event.clientY, t: performance.now() };
-  setStatus("正在搅动液体。继续拖动，观察液面倾斜和撞壁荧光。");
+  setStatus("正在搅动液体。继续拖动，观察局部撞击带和荧光余辉。");
 });
 
 window.addEventListener("pointermove", (event) => {
@@ -656,7 +867,7 @@ window.addEventListener("pointermove", (event) => {
 function releasePointer() {
   state.pointerDown = false;
   state.lastPointer = null;
-  setStatus("拖动屏幕可搅动液体。手机上启用传感器后，可用倾斜和晃动触发撞壁发光。");
+  setStatus("拖动屏幕可直接搅动液体。手机上启用传感器后，可用倾斜和晃动触发局部发光。");
 }
 
 window.addEventListener("pointerup", releasePointer);
